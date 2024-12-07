@@ -137,7 +137,7 @@ static LOGGER: LoggerToFile = LoggerToFile {
     // and maybe $HOME/.vic/log for linux, or that $XDG_HOME thing
     path: "/tmp/vic_log",
 };
-const DOWNSCALE_FACTOR: f64 = 0.5; // 0.125;
+const DOWNSCALE_FACTOR: f64 = 0.125; // 0.125;
 const NUM_COLOR_CHANNELS: i32 = 3;
 const NUM_FRAMES_TO_TRACK_FPS: u8 = 10; // arbitrary interval to recalculate fps
 
@@ -365,8 +365,8 @@ impl FrameIterator {
         // ffmpeg must be available on $PATH.
         // tested with ffmpeg version 3.4.8-ubuntu... built with gcc 7
 
-        let mut process = std::process::Command::new("ffmpeg")
-            .args(["-ss", &format!("{:0<3}", start_time)])
+        let mut process = std::process::Command::new("ffmpeg");
+        process
             .args(["-i", &video_filepath])
             // .args(["-nostdin"]) -nostdin perhaps solves: https://stackoverflow.com/a/47114881
             //
@@ -408,7 +408,8 @@ impl FrameIterator {
             // So I think it would be challenging to parse stderr.
             // And there's more important features/fixes to focus on for now.
             //
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut process = process
             .spawn()
             .map_err(|_| "ffmpeg decoding process failed")?;
 
@@ -435,24 +436,26 @@ impl FrameIterator {
         // --- CHAFA CONFIG --- //
 
         let symbol_map = chafa::SymbolMap::new();
-        symbol_map.add_by_tags(match blocky {
-            // SOLID = 1 symbol, full height block, which is ugly
-            // VHALF = 2 symbols, commonly used by other image2ansi libraries
-            // HALF = 4 symbols, horizontal or vertical half, just as ugly as SOLID
-            true => chafa::Symbols::VHALF,
-            //
-            // 29 + 11 + 97 ~= 140 symbols, fast enough and pretty enough
-            // TODO: maybe remove border symbols from this combo?
-            // since block + geometric looks decent,
-            // and there are a lot of border symbols (eg. noticeable performance impact)
-            false => chafa::Symbols::BLOCK | chafa::Symbols::GEOMETRIC | chafa::Symbols::BORDER,
-            //
-            // false => chafa::Symbols::ALL, // ~600 symbols, very slow
-        });
+        symbol_map.add_by_tags(chafa::Symbols::ASCII);
+        // symbol_map.add_by_tags(match blocky {
+        //     // SOLID = 1 symbol, full height block, which is ugly
+        //     // VHALF = 2 symbols, commonly used by other image2ansi libraries
+        //     // HALF = 4 symbols, horizontal or vertical half, just as ugly as SOLID
+        //     true => chafa::Symbols::VHALF,
+        //     //
+        //     // 29 + 11 + 97 ~= 140 symbols, fast enough and pretty enough
+        //     // TODO: maybe remove border symbols from this combo?
+        //     // since block + geometric looks decent,
+        //     // and there are a lot of border symbols (eg. noticeable performance impact)
+        //     false => chafa::Symbols::BLOCK | chafa::Symbols::GEOMETRIC | chafa::Symbols::BORDER,
+        //     //
+        //     // false => chafa::Symbols::ALL, // ~600 symbols, very slow
+        // });
         let config = chafa::Config::new();
         config.set_geometry(output_cols as i32, output_rows as i32);
         config.set_symbol_map(symbol_map);
         config.set_work_factor(1.0);
+        config.set_fg_only(true);
         //
         // TODO: check bindings to make sure chafa enums carry over properly
         // these other canvas color modes aren't working for me
@@ -499,16 +502,6 @@ impl FrameIterator {
             self.stdout.read_exact(&mut self.pixel_buffer);
         }
         return self.take_frame();
-    }
-
-    fn goto_timestamp(&mut self, timestamp: SecondsFloat) -> Result<String, Box<dyn Error>> {
-        // Start new process at any position in video.
-        // This should be faster than reading far ahead in the old process,
-        // and this enables "backward seeking" too.
-
-        let new_stdout = FrameIterator::_create_decoding_process(&self.video_path, timestamp)?;
-        self.stdout = new_stdout;
-        Ok(self.take_frame())
     }
 }
 
@@ -578,7 +571,6 @@ fn init() -> Result<Model, String> {
    [ marker mode ]
 
      M ....... delete marker
-     J/L ..... goto prev/next marker
 
  _____
  NOTES
@@ -718,10 +710,6 @@ fn update(m: &mut Model, terminal_event: Event) -> UpdateResult {
             match keyevent.code {
                 KeyCode::Char(' ') => toggle_paused(m),
                 KeyCode::Char('h') => toggle_controls_visibility(m),
-                KeyCode::Char('j') => seek_backwards_15s(m),
-                KeyCode::Char('l') => seek_forwards_15s(m),
-                KeyCode::Char('J') => goto_prev_marker(m),
-                KeyCode::Char('L') => goto_next_marker(m),
                 KeyCode::Char('m') => create_marker(m),
                 KeyCode::Char('M') => delete_marker(m),
                 KeyCode::Char('.') => advance_one_frame(m),
@@ -884,77 +872,6 @@ fn update_if_moved_behind_segment(m: &mut Model) {
             false => break,
         }
     }
-}
-
-fn seek_backwards_15s(m: &mut Model) {
-    let frames_to_backtrack = (m.VIDEO_METADATA.fps * 15.0) as u32;
-    m.frame_number = std::cmp::max(m.frame_number as i32 - frames_to_backtrack as i32, 0) as u32;
-    let timestamp = m.frame_number as SecondsFloat / m.VIDEO_METADATA.fps;
-    m.frame = m.frame_iterator.goto_timestamp(timestamp).unwrap();
-
-    update_if_moved_behind_segment(m);
-    m.hovered_item.mode = HoverMode::Segments;
-}
-
-fn seek_forwards_15s(m: &mut Model) {
-    let frames_to_skip = (m.VIDEO_METADATA.fps * 15.0) as u32;
-    m.frame_number += frames_to_skip;
-    let timestamp = m.frame_number as SecondsFloat / m.VIDEO_METADATA.fps;
-    m.frame = m.frame_iterator.goto_timestamp(timestamp).unwrap();
-
-    update_if_moved_past_segment(m);
-    m.hovered_item.mode = HoverMode::Segments;
-}
-
-fn goto_prev_marker(m: &mut Model) {
-    // enter marker mode and goto nearest backwards timestamp
-    //
-    // segment    0     1     2
-    //         ┌─────┬─────┬──────┐
-    //         └─────┴─────┴──────┘
-    // marker        0     1
-    //
-    let new_position = m.hovered_item.position as i32 - 1;
-    match new_position >= 0 {
-        false => (),
-        true => {
-            m.hovered_item = Hovering {
-                mode: HoverMode::Markers,
-                position: new_position as usize,
-            };
-            let timestamp: SecondsFloat = m.markers[new_position as usize];
-            m.frame_number = (timestamp * m.VIDEO_METADATA.fps) as u32;
-            m.frame = m.frame_iterator.goto_timestamp(timestamp).unwrap();
-            m.paused = true;
-        }
-    }
-}
-
-fn goto_next_marker(m: &mut Model) {
-    // enter marker mode and goto nearest forwards timestamp
-    //
-    // segment    0     1     2
-    //         ┌─────┬─────┬──────┐
-    //         └─────┴─────┴──────┘
-    // marker        0     1
-    //
-    let new_position = match m.hovered_item.mode {
-        HoverMode::Markers => m.hovered_item.position + 1,
-        HoverMode::Segments => m.hovered_item.position,
-    };
-    match new_position < m.markers.len() {
-        false => (),
-        true => {
-            m.hovered_item = Hovering {
-                mode: HoverMode::Markers,
-                position: new_position,
-            };
-            let timestamp: SecondsFloat = m.markers[new_position];
-            m.frame_number = (timestamp * m.VIDEO_METADATA.fps) as u32;
-            m.frame = m.frame_iterator.goto_timestamp(timestamp).unwrap();
-            m.paused = true;
-        }
-    };
 }
 
 fn create_marker(m: &mut Model) {

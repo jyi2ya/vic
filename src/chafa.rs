@@ -131,6 +131,13 @@ impl Config {
         }
     }
 
+    pub fn set_fg_only(&self, enabled: bool) {
+        let enabled = enabled.then_some(1).unwrap_or(0);
+        unsafe {
+            chafa_sys::chafa_canvas_config_set_fg_only_enabled(self._ptr, enabled);
+        }
+    }
+
     pub fn set_geometry(&self, width: i32, height: i32) {
         unsafe {
             chafa_sys::chafa_canvas_config_set_geometry(self._ptr, width, height);
